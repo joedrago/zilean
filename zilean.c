@@ -160,10 +160,13 @@ void zBitmapGrayscale(zBitmap * zbmp, RECT *rect)
     }
 }
 
+// returns true on a match
+typedef int (*zFindBoxPixelMatchFunc)(Pixel *pixel, void *userdata);
+
 // alpha channel is the tolerance for that color
-int zBitmapFindColoredBox(zBitmap *zbmp, RECT *subRect, int colorCount, Pixel *colors, int lineTolerance, RECT *outputRect)
+int zBitmapFindBox(zBitmap *zbmp, RECT *subRect, zFindBoxPixelMatchFunc func, void *userdata, float lineToleranceX, float lineToleranceY, RECT *outputRect, int debug)
 {
-    int i, j, k;
+    int i, j;
     int *colCounts;
     int *rowCounts;
     int bestRowCount = 0;
@@ -189,17 +192,8 @@ int zBitmapFindColoredBox(zBitmap *zbmp, RECT *subRect, int colorCount, Pixel *c
     {
         for (i = sub.left; i < sub.right; ++i)
         {
-            int matches = 0;
             Pixel * pixel = &zbmp->pixels[i + (j * zbmp->w)];
-            for(k = 0; k < colorCount; ++k)
-            {
-                if(pixelMatches(pixel, colors[k].r, colors[k].g, colors[k].b, colors[k].a))
-                {
-                    matches = 1;
-                    break;
-                }
-            }
-            if(matches)
+            if(func(pixel, userdata))
             {
                 ++colCounts[i];
                 ++rowCounts[j];
@@ -227,29 +221,64 @@ int zBitmapFindColoredBox(zBitmap *zbmp, RECT *subRect, int colorCount, Pixel *c
     for (i = sub.left; i < sub.right; ++i)
     {
         if((outputRect->left > i)
-        && (closeEnough(colCounts[i], bestColCount, lineTolerance)))
+        && (closeEnough(colCounts[i], bestColCount, bestColCount - (bestColCount * lineToleranceX))))
         {
             outputRect->left = i;
-        }
-        if((outputRect->right < i)
-        && (closeEnough(colCounts[i], bestColCount, lineTolerance)))
-        {
-            outputRect->right = i;
+            break;
         }
     }
+    for (i = sub.right - 1; i >= sub.left; --i)
+    {
+        if((outputRect->right < i)
+        && (closeEnough(colCounts[i], bestColCount, bestColCount - (bestColCount * lineToleranceX))))
+        {
+            outputRect->right = i;
+            break;
+        }
+    }
+
     outputRect->top = sub.bottom;
     outputRect->bottom = sub.top;
     for (j = sub.top; j < sub.bottom; ++j)
     {
         if((outputRect->top > j)
-        && (closeEnough(rowCounts[j], bestRowCount, lineTolerance)))
+        && (closeEnough(rowCounts[j], bestRowCount, bestRowCount - (bestRowCount * lineToleranceY))))
         {
             outputRect->top = j;
         }
+    }
+    for (j = sub.bottom - 1; j >= sub.top; --j)
+    {
         if((outputRect->bottom < j)
-        && (closeEnough(rowCounts[j], bestRowCount, lineTolerance)))
+        && (closeEnough(rowCounts[j], bestRowCount, bestRowCount - (bestRowCount * lineToleranceY))))
         {
             outputRect->bottom = j;
+        }
+    }
+
+    if(debug)
+    {
+        for (i = sub.left; i < sub.right; ++i)
+        {
+            int k;
+            for(k = 0; k < colCounts[i]; ++k)
+            {
+                Pixel * pixel = &zbmp->pixels[i + ((sub.top+k) * zbmp->w)];
+                pixel->r = 255;
+                pixel->g = 192;
+                pixel->b = 255;
+            }
+        }
+        for (j = sub.top; j < sub.bottom; ++j)
+        {
+            int k;
+            for(k = 0; k < rowCounts[j]; ++k)
+            {
+                Pixel * pixel = &zbmp->pixels[(sub.left+k) + (j * zbmp->w)];
+                pixel->r = 192;
+                pixel->g = 255;
+                pixel->b = 192;
+            }
         }
     }
 
@@ -330,8 +359,7 @@ zBitmap * loadScoreboard(const char * file_name);
 
 static void checkScoreboard(HWND mainDlg)
 {
-#if 1
-#else
+#if 0
     int scoreboardKeyHeld = (GetAsyncKeyState(VK_TAB) & 0x8000) ? 1 : 0;
     if (scoreboardKeyHeld)
     {
@@ -486,37 +514,119 @@ zBitmap * loadScoreboard(const char * file_name)
     return zbmp;
 }
 
+struct ColorList
+{
+    Pixel *colors;
+    int count;
+};
+
+int pixelMatchesColors(Pixel *pixel, void *userdata)
+{
+    int k;
+    struct ColorList *colorList = (struct ColorList *)userdata;
+    for(k = 0; k < colorList->count; ++k)
+    {
+        if(pixelMatches(pixel, colorList->colors[k].r, colorList->colors[k].g, colorList->colors[k].b, colorList->colors[k].a))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+struct GrayRange
+{
+    int tolerance;
+    int low;
+    int high;
+};
+
+struct GrayRange gChampBoxGray = { 5, 19, 80 };
+
+int pixelIsAGray(Pixel *pixel, void *userdata)
+{
+    int avg;
+    struct GrayRange *range = (struct GrayRange *)userdata;
+    if(abs(pixel->r - pixel->g) > range->tolerance) return 0;
+    if(abs(pixel->r - pixel->b) > range->tolerance) return 0;
+    if(abs(pixel->g - pixel->b) > range->tolerance) return 0;
+    avg = ((int)pixel->r + (int)pixel->g + (int)pixel->b) / 3;
+    if(avg < range->low) return 0;
+    if(avg > range->high) return 0;
+    return 1;
+}
+
+void findChampionRows(zBitmap *zbmp, RECT *facesBox)
+{
+    int i, j;
+    int currentTop = -1;
+    for(j = facesBox->top; j < facesBox->bottom; ++j)
+    {
+        Pixel * pixel = &zbmp->pixels[facesBox->left + (j * zbmp->w)];
+        int isGray = pixelIsAGray(pixel, &gChampBoxGray);
+        if(isGray)
+        {
+            pixel->r = 0;
+            pixel->g = 255;
+            pixel->b = 0;
+        }
+        else
+        {
+            pixel->r = 255;
+            pixel->g = 0;
+            pixel->b = 0;
+        }
+        if(currentTop == -1)
+        {
+            if(isGray)
+            {
+                currentTop = j;
+            }
+        }
+        else
+        {
+            if(!isGray)
+            {
+                printf("found a champion row: [%d -> %d]\n", currentTop, j);
+                currentTop = -1;
+            }
+        }
+    }
+}
+
 void findThings(zBitmap *zbmp)
 {
+    Pixel scoreColors[4];
+    struct ColorList colorList;
     RECT subBox;
     RECT scoreBox;
-    Pixel scoreColors[2];
     RECT facesBox;
-    Pixel facesColors[4];
 
     // Rough greenish colors of outer scoreboard box
     pixelSet(&scoreColors[0], 24, 63, 60, 4);
     pixelSet(&scoreColors[1], 33, 69, 61, 4);
-    zBitmapFindColoredBox(zbmp, NULL, 2, scoreColors, 30, &scoreBox);
+    pixelSet(&scoreColors[2], 31, 63, 59, 7);
+    pixelSet(&scoreColors[3], 34, 74, 64, 3);
+    colorList.colors = scoreColors;
+    colorList.count = 4;
+    zBitmapFindBox(zbmp, NULL, pixelMatchesColors, &colorList, 0.5f, 0.9f, &scoreBox, 0);
     printf("scorebox location: [%d, %d, %d, %d]\n", scoreBox.left, scoreBox.top, scoreBox.right, scoreBox.bottom);
-    //zBitmapFill(zbmp, &scoreBox, 255, 255, 0);
+    //zBitmapBox(zbmp, &scoreBox, 255, 255, 0);
 
-    // Grays that match the borders of the champion's faces
-    pixelSet(&facesColors[0], 29, 30, 32, 1);
-    pixelSet(&facesColors[1], 69, 69, 67, 1);
-    pixelSet(&facesColors[2], 74, 75, 74, 1);
-    pixelSet(&facesColors[3], 46, 47, 48, 1);
     memcpy(&subBox, &scoreBox, sizeof(RECT));
     subBox.right = subBox.left + ((subBox.right - subBox.left) / 8); // facesBox will be in the first 1/8th
-    zBitmapFindColoredBox(zbmp, &subBox, 4, facesColors, 5, &facesBox);
-    facesBox.right =  900;
+    printf("sub location: [%d, %d, %d, %d]\n", subBox.left, subBox.top, subBox.right, subBox.bottom);
+    //zBitmapBox(zbmp, &subBox, 255, 128, 0);
+    zBitmapFindBox(zbmp, &subBox, pixelIsAGray, &gChampBoxGray, 0.7f, 0.4f, &facesBox, 0);
     printf("facesbox location: [%d, %d, %d, %d]\n", facesBox.left, facesBox.top, facesBox.right, facesBox.bottom);
-    zBitmapBox(zbmp, &facesBox, 255, 0, 255);
+    //zBitmapBox(zbmp, &facesBox, 255, 0, 255);
+
+    findChampionRows(zbmp, &facesBox);
 }
 
 void debug(HWND mainDlg)
 {
-    zBitmap *zbmp = loadScoreboard("images\\board1.png");
+    zBitmap *zbmp = loadScoreboard("images\\board3.png");
     if(zbmp)
     {
         HDC dc = GetDC(mainDlg);
@@ -595,7 +705,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpCmdL
 #ifdef _DEBUG
     AllocConsole();
     SetConsoleTitle("Zilean Debug Output");
-    freopen("CONOUT$", "w", stderr);
+    freopen("CONOUT$", "wt", stdout);
+    freopen("CONOUT$", "wt", stderr);
 #endif
 
     {
